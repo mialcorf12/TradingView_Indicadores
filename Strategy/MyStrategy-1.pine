@@ -1,0 +1,397 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © albertocorderoulab
+
+//@version=6
+strategy("NASDAQ HEDGE FUND SCALPING STRATEGY V1", shorttitle="Mike_Strategy", overlay=true,
+     initial_capital=25000, default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.01, slippage=1,
+     process_orders_on_close=true, calc_on_every_tick=false,
+     max_labels_count=500, max_lines_count=500)
+
+// =====================================================================================
+// Automated version of Setup.pine (Mike_Setup). Same 4-factor score, same filters, same ATR SL / TP.
+//   - Signals are evaluated on bar close; orders fill on that close (process_orders_on_close).
+//   - One position at a time (no pyramiding): repeated 75% signals inside a trend are ignored.
+//   - Live execution: create ONE alert on this strategy with the message  {{strategy.order.alert_message}}
+//     → each order sends a JSON payload ready for a webhook / broker bridge.
+//
+// STRUCTURE
+//   1. Constants        4. Pure functions        7. Module: VWAP + ORB
+//   2. Inputs           5. Market data           8. Orders + risk management
+//   3. Types            6. Module: Scoring       9. Plots + dashboard
+// =====================================================================================
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                 1. CONSTANTS                 ║
+// ╚══════════════════════════════════════════════╝
+
+const string TZ_NY = "America/New_York"
+
+// Scoring: each of the 4 factors weighs the same; entry thresholds are expressed in score points.
+const int SCORE_WEIGHT = 25
+const int SCORE_ENTRY  = 75
+const int SCORE_FULL   = 100
+
+// Session anchors (NY time)
+const string ORB_SESSION         = "0930-1600"
+const int    ORB_SESSION_MINUTES = 390   // 9:30 → 16:00
+
+// Alert payloads (consumed through {{strategy.order.alert_message}})
+const string MSG_LONG  = '{"action":"buy","ticker":"{{ticker}}","contracts":"{{strategy.order.contracts}}","price":"{{strategy.order.price}}"}'
+const string MSG_SHORT = '{"action":"sell","ticker":"{{ticker}}","contracts":"{{strategy.order.contracts}}","price":"{{strategy.order.price}}"}'
+const string MSG_EXIT  = '{"action":"exit","ticker":"{{ticker}}","contracts":"{{strategy.order.contracts}}","price":"{{strategy.order.price}}"}'
+
+// Group names
+const string G_TRADE   = "── OPERATIVA ──"
+const string G_RISK    = "── RIESGO ──"
+const string G_FILTERS = "── FILTROS ──"
+const string G_LIMITS  = "── LÍMITES ──"
+const string G_DASH    = "── PANEL ──"
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                  2. INPUTS                   ║
+// ╚══════════════════════════════════════════════╝
+
+// ── Trading ──
+longsEnabled  = input.bool(true, "Permitir largos",  group=G_TRADE)
+shortsEnabled = input.bool(true, "Permitir cortos",  group=G_TRADE)
+onlyFull      = input.bool(false, "Solo señales 100%", group=G_TRADE, tooltip="Ignora las señales de 75%.")
+allowReverse  = input.bool(true, "Revertir con señal contraria", group=G_TRADE)
+
+// ── Risk ──
+riskLowPct  = input.float(0.5, "Riesgo % equity (75%)",  minval=0.05, step=0.05, group=G_RISK)
+riskHighPct = input.float(1.0, "Riesgo % equity (100%)", minval=0.05, step=0.05, group=G_RISK)
+maxLeverage = input.float(1.0, "Apalancamiento máx.",    minval=0.1,  step=0.1,  group=G_RISK, tooltip="Tope del nocional de la posición vs equity.")
+slMult      = input.float(1.0, "SL × ATR", minval=0.1, step=0.1, group=G_RISK)
+tpMult      = input.float(2.0, "TP × ATR", minval=0.1, step=0.1, group=G_RISK)
+useBE       = input.bool(true,  "Break-even",       group=G_RISK)
+useTrail    = input.bool(true,  "Trailing ATR",     group=G_RISK)
+beR         = input.float(1.0,  "Activar a (R)",    minval=0.1, step=0.1, group=G_RISK, tooltip="Beneficio, en múltiplos del riesgo inicial, que activa break-even y trailing.")
+trailMult   = input.float(1.0,  "Trailing × ATR",   minval=0.1, step=0.1, group=G_RISK)
+
+// ── Filters ──
+useVwapFilter = input.bool(true,  "Precio vs VWAP NY", group=G_FILTERS, tooltip="Largos solo sobre el VWAP; cortos solo bajo el VWAP.")
+useOrbFilter  = input.bool(false, "Confirmar con ORB", group=G_FILTERS, tooltip="Largos solo sobre el máximo del rango de apertura; cortos solo bajo el mínimo.")
+rangeDuration = input.int(15,  "Duración ORB (min)", minval=1, group=G_FILTERS)
+cooldownBars  = input.int(3,   "Enfriamiento tras pérdida (velas)", minval=0, group=G_FILTERS)
+
+// Setup.pine parameters, kept fixed so both scripts produce the same signals
+emaFastLen = 9
+emaMidLen  = 21
+emaSlowLen = 50
+rsiLen     = 14
+rsiBullThr = 55
+rsiBearThr = 45
+macdFast   = 12
+macdSlow   = 26
+macdSig    = 9
+volLen        = 20
+volMultiplier = 2.0
+vixBullThr = 20.0
+vixBearThr = 22.0
+atrLen     = 14
+atrMaLen   = 50
+atrFloor   = 0.8
+sessionStr = "0930-1600"
+htfTF      = "15"
+
+// ── Limits ──
+maxDaily      = input.int(10,    "Máx. operaciones por día", minval=1, group=G_LIMITS)
+dailyLossPct  = input.float(2.0, "Pérdida diaria máx. %", minval=0.1, step=0.1, group=G_LIMITS)
+flatBeforeEnd = input.bool(true, "Cerrar todo 15:55 NY", group=G_LIMITS)
+
+// ── Dashboard ──
+showDash = input.bool(true, "Mostrar panel", group=G_DASH)
+showORB  = input.bool(true, "Mostrar ORB",   group=G_DASH)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                  3. TYPES                    ║
+// ╚══════════════════════════════════════════════╝
+
+// Score of each side (0..100)
+type Score
+    int buy  = 0
+    int sell = 0
+
+// Directional bias from a trend/momentum block
+type Bias
+    bool bull = false
+    bool bear = false
+
+
+// ╔══════════════════════════════════════════════╗
+// ║              4. PURE FUNCTIONS               ║
+// ╚══════════════════════════════════════════════╝
+
+// Stacked EMAs: fast > mid > slow (bull) or the inverse (bear)
+f_trend(float fast, float mid, float slow) =>
+    Bias.new(fast > mid and mid > slow, fast < mid and mid < slow)
+
+// RSI beyond threshold and MACD line on the matching side of its signal
+f_momentum(float rsiValue, float macdLine, float macdSignal) =>
+    Bias.new(rsiValue > rsiBullThr and macdLine > macdSignal,
+             rsiValue < rsiBearThr and macdLine < macdSignal)
+
+// VIX regime; `na` VIX counts as neutral
+f_vix(float vixValue) =>
+    Bias.new(not na(vixValue) and vixValue < vixBullThr,
+             not na(vixValue) and vixValue > vixBearThr)
+
+// Four equal-weight factors → score per side
+f_score(Bias trend, Bias momentum, Bias flow, Bias vix) =>
+    Score.new(
+         (trend.bull ? SCORE_WEIGHT : 0) + (momentum.bull ? SCORE_WEIGHT : 0) + (flow.bull ? SCORE_WEIGHT : 0) + (vix.bull ? SCORE_WEIGHT : 0),
+         (trend.bear ? SCORE_WEIGHT : 0) + (momentum.bear ? SCORE_WEIGHT : 0) + (flow.bear ? SCORE_WEIGHT : 0) + (vix.bear ? SCORE_WEIGHT : 0))
+
+// Whole units so that risk-per-trade = riskPct of equity, capped by the max notional (futures use pointvalue)
+f_qty(float riskPct, float slDistance) =>
+    float perUnit  = slDistance * syminfo.pointvalue
+    float byRisk   = perUnit > 0 ? strategy.equity * riskPct / 100 / perUnit : 0.0
+    float byNotion = strategy.equity * maxLeverage / (close * syminfo.pointvalue)
+    math.floor(math.min(byRisk, byNotion))
+
+// One dashboard row: label cell + value cell sharing a background
+f_row(table t, int row, string name, string value, color bg) =>
+    table.cell(t, 0, row, name,  bgcolor=bg, text_color=color.white, text_size=size.small)
+    table.cell(t, 1, row, value, bgcolor=bg, text_color=color.white, text_size=size.small)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║              5. MARKET DATA                  ║
+// ╚══════════════════════════════════════════════╝
+
+// Previous-day close with lookahead_on (same as Setup.pine): no leak of the day's final value.
+vix = request.security("CBOE:VIX", "D", close[1], lookahead=barmerge.lookahead_on)
+
+// HTF trend: last CLOSED HTF bar ([1] + lookahead_on) → identical on historical and realtime, so the
+// backtest matches live behavior. Costs one HTF bar of lag versus the indicator, on purpose.
+[htfFast, htfSlow] = request.security(
+     syminfo.tickerid, htfTF,
+     [ta.ema(close, emaFastLen)[1], ta.ema(close, emaSlowLen)[1]],
+     lookahead=barmerge.lookahead_on)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║             6. MODULE: SCORING               ║
+// ╚══════════════════════════════════════════════╝
+
+// ── Indicators ──
+emaFast = ta.ema(close, emaFastLen)
+emaMid  = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsi     = ta.rsi(close, rsiLen)
+[macdLine, macdSignal, _] = ta.macd(close, macdFast, macdSlow, macdSig)
+atr     = ta.atr(atrLen)
+atrMA   = ta.sma(atr, atrMaLen)
+volMA   = ta.sma(volume, volLen)
+
+// ── Factors ──
+Bias trend    = f_trend(emaFast, emaMid, emaSlow)
+Bias momentum = f_momentum(rsi, macdLine, macdSignal)
+Bias vixBias  = f_vix(vix)
+
+institutionalVolume = volume > volMA * volMultiplier
+Bias flow = Bias.new(institutionalVolume and close > open and close > close[1],
+                     institutionalVolume and close < open and close < close[1])
+
+Score score = f_score(trend, momentum, flow, vixBias)
+int buyers  = score.buy
+int sellers = score.sell
+
+// ── Filters ──
+atrFilter = atr > atrMA * atrFloor
+nySession = time(timeframe.period, sessionStr, TZ_NY)
+inSession = not na(nySession)
+flatWindow = not na(time(timeframe.period, "1555-1600", TZ_NY))
+htfOkBuy  = htfFast > htfSlow
+htfOkSell = htfFast < htfSlow
+
+// Session anchor: first bar of the RTH session (robust on futures, where "D" changes the evening before)
+newSession = inSession and na(nySession[1])
+
+
+// ╔══════════════════════════════════════════════╗
+// ║           7. MODULE: VWAP + ORB              ║
+// ╚══════════════════════════════════════════════╝
+
+// ── VWAP NY (resets at 9:30 NY) ──
+vwapNY = ta.vwap(hlc3, newSession)
+
+// ── Opening range ──
+var int sessionStartTime = na
+var int sessionEndTime   = na
+var int sessionCloseTime = na
+
+if newSession
+    sessionStartTime := time
+    sessionEndTime   := time + rangeDuration * 60 * 1000
+    sessionCloseTime := time + ORB_SESSION_MINUTES * 60 * 1000
+
+hasSession       = not na(sessionStartTime)
+isInOpeningRange = hasSession and time >= sessionStartTime and time < sessionEndTime
+
+var float openingHigh = na
+var float openingLow  = na
+var int   highBarTime = na
+var int   lowBarTime  = na
+
+if newSession
+    openingHigh := na
+    openingLow  := na
+    highBarTime := na
+    lowBarTime  := na
+
+if isInOpeningRange
+    if na(openingHigh) or high > openingHigh
+        openingHigh := high
+        highBarTime := time
+    if na(openingLow) or low < openingLow
+        openingLow := low
+        lowBarTime := time
+
+// End of the opening range → draw levels, projected to the session close
+isOpeningRangeEnd = isInOpeningRange[1] and not isInOpeningRange
+if showORB and isOpeningRangeEnd and not na(openingHigh) and not na(openingLow)
+    line.new(highBarTime, openingHigh, sessionCloseTime, openingHigh, xloc=xloc.bar_time, color=color.new(#ff00dd, 0), width=2)
+    line.new(lowBarTime,  openingLow,  sessionCloseTime, openingLow,  xloc=xloc.bar_time, color=color.new(#ff00dd, 0), width=2)
+
+orbReady   = hasSession and not isInOpeningRange and not na(openingHigh) and not na(openingLow)
+orbOkBuy   = not useOrbFilter or (orbReady and close > openingHigh)
+orbOkSell  = not useOrbFilter or (orbReady and close < openingLow)
+vwapOkBuy  = not useVwapFilter or close > vwapNY
+vwapOkSell = not useVwapFilter or close < vwapNY
+
+
+// ╔══════════════════════════════════════════════╗
+// ║         8. ORDERS + RISK MANAGEMENT          ║
+// ╚══════════════════════════════════════════════╝
+
+// ── Daily state ──
+var float dayStartEquity = na
+var int   tradesToday    = 0
+var bool  dayHalted      = false
+
+if newSession
+    dayStartEquity := strategy.equity
+    tradesToday    := 0
+    dayHalted      := false
+
+dayPnlPct = na(dayStartEquity) ? 0.0 : (strategy.equity - dayStartEquity) / dayStartEquity * 100
+if dayPnlPct <= -dailyLossPct
+    dayHalted := true
+
+// ── Loss cooldown: bar of the last losing closed trade ──
+var int lastLossBar = na
+var int prevClosed  = 0
+if strategy.closedtrades > prevClosed
+    if strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        lastLossBar := bar_index
+    prevClosed := strategy.closedtrades
+cooldownOk = na(lastLossBar) or bar_index - lastLossBar > cooldownBars
+
+// ── Signals (same rules as Setup.pine) ──
+buyBase  = atrFilter and inSession and buyers  >= SCORE_ENTRY and htfOkBuy
+sellBase = atrFilter and inSession and sellers >= SCORE_ENTRY and htfOkSell
+fullBuy  = buyBase  and buyers  == SCORE_FULL
+fullSell = sellBase and sellers == SCORE_FULL
+
+entryAllowed = barstate.isconfirmed and not dayHalted and not (flatBeforeEnd and flatWindow)
+               and tradesToday < maxDaily and cooldownOk
+
+buyOk  = longsEnabled  and buyBase  and (not onlyFull or fullBuy)  and vwapOkBuy  and orbOkBuy
+sellOk = shortsEnabled and sellBase and (not onlyFull or fullSell) and vwapOkSell and orbOkSell
+
+canLong  = strategy.position_size == 0 or (allowReverse and strategy.position_size < 0)
+canShort = strategy.position_size == 0 or (allowReverse and strategy.position_size > 0)
+
+// ── SL / TP levels, identical to the indicator's labels ──
+float longSl  = low  - atr * slMult
+float longTp  = close + atr * tpMult
+float shortSl = high + atr * slMult
+float shortTp = close - atr * tpMult
+
+float qLong  = f_qty(fullBuy  ? riskHighPct : riskLowPct, close - longSl)
+float qShort = f_qty(fullSell ? riskHighPct : riskLowPct, shortSl - close)
+
+openLong  = entryAllowed and buyOk  and canLong  and qLong  >= 1
+openShort = entryAllowed and sellOk and canShort and qShort >= 1 and not openLong
+
+// ── Trade state: live stop / target / initial risk of the open position ──
+var float slPrice = na
+var float tpPrice = na
+var float entryPx = na
+var float riskDist = na
+
+if openLong
+    strategy.entry("Long", strategy.long, qty=qLong, alert_message=MSG_LONG)
+    slPrice  := longSl
+    tpPrice  := longTp
+    entryPx  := close
+    riskDist := close - longSl
+    tradesToday += 1
+else if openShort
+    strategy.entry("Short", strategy.short, qty=qShort, alert_message=MSG_SHORT)
+    slPrice  := shortSl
+    tpPrice  := shortTp
+    entryPx  := close
+    riskDist := shortSl - close
+    tradesToday += 1
+else if strategy.position_size > 0
+    // Ratchet only upwards for longs
+    if useBE and high >= entryPx + riskDist * beR
+        slPrice := math.max(slPrice, entryPx)
+    if useTrail and close >= entryPx + riskDist * beR
+        slPrice := math.max(slPrice, close - atr * trailMult)
+else if strategy.position_size < 0
+    // Ratchet only downwards for shorts
+    if useBE and low <= entryPx - riskDist * beR
+        slPrice := math.min(slPrice, entryPx)
+    if useTrail and close <= entryPx - riskDist * beR
+        slPrice := math.min(slPrice, close + atr * trailMult)
+
+// ── Exits (a pending exit is re-issued every bar so the trailing stop takes effect) ──
+if openLong or (strategy.position_size > 0 and not openShort)
+    strategy.exit("Exit Long", "Long", stop=slPrice, limit=tpPrice, alert_message=MSG_EXIT)
+if openShort or (strategy.position_size < 0 and not openLong)
+    strategy.exit("Exit Short", "Short", stop=slPrice, limit=tpPrice, alert_message=MSG_EXIT)
+
+// ── Forced flat: end of day or daily loss cap ──
+if strategy.position_size != 0 and ((flatBeforeEnd and flatWindow) or dayHalted)
+    strategy.close_all(comment=dayHalted ? "LOSS CAP" : "EOD", alert_message=MSG_EXIT)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║           9. PLOTS + DASHBOARD               ║
+// ╚══════════════════════════════════════════════╝
+
+plot(emaFast, color=color.blue,    linewidth=2, title="EMA 9",  editable=false)
+plot(emaMid,  color=color.orange,  linewidth=2, title="EMA 21", linestyle=plot.linestyle_dashed, editable=false)
+plot(emaSlow, color=color.fuchsia, linewidth=1, title="EMA 50", editable=false)
+plot(inSession ? vwapNY : na, color=color.rgb(135, 206, 235), linewidth=1, title="VWAP NY", editable=false)
+
+plot(strategy.position_size != 0 ? slPrice : na, color=color.new(color.fuchsia, 30), style=plot.style_linebr, title="Stop", editable=false)
+plot(strategy.position_size != 0 ? tpPrice : na, color=color.new(color.blue, 30),    style=plot.style_linebr, title="Target", editable=false)
+
+var table dash = table.new(position.top_right, 2, 7, border_width=1, border_color=color.new(color.gray, 50))
+
+if showDash and barstate.islast
+    color greenDark  = color.new(color.green, 20)
+    color greenLight = color.new(color.green, 55)
+    color redDark    = color.new(color.red,   20)
+    color redLight   = color.new(color.red,   55)
+    color grayDark   = color.new(color.gray,  20)
+    color grayLight  = color.new(color.gray,  55)
+
+    f_row(dash, 0, "ESTRATEGIA", "ESTADO", grayDark)
+
+    string posLbl = strategy.position_size > 0 ? "LARGO  ▲" : strategy.position_size < 0 ? "CORTO  ▼" : "FUERA  —"
+    f_row(dash, 1, "POSICIÓN", posLbl, strategy.position_size > 0 ? greenDark : strategy.position_size < 0 ? redDark : grayLight)
+
+    f_row(dash, 2, "COMPRADORES", str.tostring(buyers)  + "%", buyers  >= SCORE_ENTRY ? greenDark : greenLight)
+    f_row(dash, 3, "VENDEDORES",  str.tostring(sellers) + "%", sellers >= SCORE_ENTRY ? redDark   : redLight)
+    f_row(dash, 4, "P&L DÍA", str.tostring(math.round(dayPnlPct, 2)) + "%", dayPnlPct >= 0 ? greenLight : redLight)
+    f_row(dash, 5, "OPERACIONES/DÍA", str.tostring(tradesToday) + " / " + str.tostring(maxDaily), tradesToday >= maxDaily ? redLight : grayDark)
+    f_row(dash, 6, "TRADING", dayHalted ? "DETENIDO (PÉRDIDA)" : inSession ? "ACTIVO  ✓" : "FUERA DE SESIÓN", dayHalted ? redLight : inSession ? greenLight : grayLight)
