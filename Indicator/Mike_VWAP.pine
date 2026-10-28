@@ -1,0 +1,20 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © albertocorderoulab
+
+//@version=6
+indicator("VWAP", shorttitle="Mike_VWAP", overlay=true, max_labels_count=500)
+
+// ╔══════════════════════════════════════════════╗
+// ║                     VWAP                     ║
+// ╚══════════════════════════════════════════════╝
+
+// VWAP diario: se reinicia al comenzar cada día
+vwapDaily = ta.vwap(hlc3, timeframe.change("D"))
+
+// VWAP NY: se reinicia a las 9:30 NY y solo se dibuja en la sesión regular
+nySession = time(timeframe.period, "0930-1600", "America/New_York")
+nyStart   = not na(nySession) and na(nySession[1])
+vwapNY    = ta.vwap(hlc3, nyStart)
+
+plot(vwapDaily, color=color.gray, linewidth=1, title="VWAP Diario", linestyle=plot.linestyle_dashed)
+plot(na(nySession) ? na : vwapNY, color=color.rgb(135, 206, 235), linewidth=1, title="VWAP NY")

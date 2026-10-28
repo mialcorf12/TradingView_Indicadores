@@ -1,0 +1,153 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © albertocorderoulab
+
+//@version=6
+indicator("ORB - Ruptura del Rango de Apertura + Alertas", "Mike_ORB", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ╔══════════════════════════════════════════════╗
+// ║               CONFIGURACIÓN                  ║
+// ╚══════════════════════════════════════════════╝
+
+// rangeDuration    = input.int(15, "Opening Range Duration (Minutes)", minval=1)
+// showAlerts       = input.bool(true, "Show Breakout Alerts")
+// showPriceLabels  = input.bool(true, "Show Price Labels on Scale")
+// showRangeFill    = input.bool(true, "Show Range Fill")
+// fillColor        = input.color(color.new(color.white, 90), "Range Fill Color")
+
+// highColor        = input.color(color.new(#ff00dd, 0), "Range High Color")
+// lowColor         = input.color(color.new(#ff00dd, 0), "Range Low Color")
+// highThickness    = input.int(4, "Range High Thickness", minval=1)
+// lowThickness     = input.int(4, "Range Low Thickness", minval=1)
+
+showORB = input.bool(true, "Mostrar ORB")
+
+rangeDuration    = 15
+showAlerts       = true
+showPriceLabels  = true
+showRangeFill    = true
+fillColor        = color.new(color.white, 90)
+
+highColor        = color.new(#ff00dd, 0)
+lowColor         = color.new(#ff00dd, 0)
+highThickness    = 4
+lowThickness     = 4
+
+// ╔══════════════════════════════════════════════╗
+// ║               HORA APERTURA                  ║
+// ╚══════════════════════════════════════════════╝
+var int sessionStartTime = 0
+var int sessionEndTime   = 0
+var int sessionCloseTime = 0   // 4:00 PM ET — borde derecho fijo para los dibujos del día
+isNewDay = dayofmonth != dayofmonth[1]
+
+if isNewDay
+    sessionStartTime := timestamp("America/New_York", year, month, dayofmonth, 9, 30)
+    sessionEndTime   := sessionStartTime + (rangeDuration * 60 * 1000)
+    sessionCloseTime := timestamp("America/New_York", year, month, dayofmonth, 16, 0)
+
+isInOpeningRange = time >= sessionStartTime and time < sessionEndTime
+
+// ╔══════════════════════════════════════════════╗
+// ║             Max/Min del ORB                  ║
+// ╚══════════════════════════════════════════════╝
+// Almacenamiento de máximos/mínimos del OR (guarda la HORA de los extremos para dibujos basados en tiempo)
+var float openingHigh = na
+var float openingLow  = na
+var int   highBarTime = na
+var int   lowBarTime  = na
+
+// Objetos de dibujo del día actual (los días anteriores persisten; las referencias se reinician cada día)
+var line  highRay        = na
+var line  lowRay         = na
+var box   rangeBox       = na
+var label breakoutLabel  = na
+var label missingLabel   = na
+var bool  longTriggered  = false
+var bool  shortTriggered = false
+
+// Reiniciar en un nuevo día — referencias nulas SIN eliminar, para que el historial persista
+if isNewDay
+    openingHigh    := na
+    openingLow     := na
+    highBarTime    := na
+    lowBarTime     := na
+    longTriggered  := false
+    shortTriggered := false
+    highRay        := na
+    lowRay         := na
+    rangeBox       := na
+    breakoutLabel  := na
+    missingLabel   := na
+
+// Actualizar máximo/mínimo durante el Rango de Apertura
+if isInOpeningRange
+    if na(openingHigh) or high > openingHigh
+        openingHigh := high
+        highBarTime := time
+    if na(openingLow) or low < openingLow
+        openingLow := low
+        lowBarTime := time
+
+// Fin del rango de apertura — dibuja líneas y relleno proyectados hasta las 4:00 PM ET
+isOpeningRangeEnd = ta.change(isInOpeningRange) and not isInOpeningRange
+if isOpeningRangeEnd
+    if showORB and (na(openingHigh) or na(openingLow))
+        missingLabel := label.new(bar_index, high, "Faltan datos para el Rango de Apertura", color=color.red, style=label.style_label_down, textcolor=color.white)
+
+    if showORB and not na(openingHigh)
+        highRay := line.new(highBarTime, openingHigh, sessionCloseTime, openingHigh, xloc=xloc.bar_time, color=highColor, width=highThickness)
+
+    if showORB and not na(openingLow)
+        lowRay := line.new(lowBarTime, openingLow, sessionCloseTime, openingLow, xloc=xloc.bar_time, color=lowColor, width=lowThickness)
+
+    if showORB and showRangeFill and not na(openingHigh) and not na(openingLow)
+        rangeBox := box.new(left=time, top=openingHigh, right=sessionCloseTime, bottom=openingLow, xloc=xloc.bar_time, bgcolor=fillColor, border_width=0)
+
+// Gráficos de color para etiquetas de escala de precios (día actual)
+plotHigh = showPriceLabels and not na(openingHigh) and barstate.islast ? openingHigh : na
+plotLow  = showPriceLabels and not na(openingLow)  and barstate.islast ? openingLow  : na
+
+
+// ╔══════════════════════════════════════════════╗
+// ║             RUPTURAS DEL ORB                 ║
+// ╚══════════════════════════════════════════════╝
+// === Detección de rupturas (temporalidad del gráfico, se activa al cierre de barra, compatible con gap-and-go) ===
+longBreakoutSignal  = close > openingHigh
+shortBreakoutSignal = close < openingLow
+
+bool longBreakout  = false
+bool shortBreakout = false
+
+if not isInOpeningRange and time >= sessionEndTime and not na(openingHigh) and not na(openingLow) and barstate.isconfirmed
+    if longBreakoutSignal and not longTriggered
+        longTriggered  := true
+        shortTriggered := false
+        longBreakout   := true
+        if showORB and showAlerts
+            breakoutLabel := label.new(bar_index, openingHigh, "COMPRA", color=color.green, textcolor=color.white, style=label.style_label_right, size=size.large)
+
+    if shortBreakoutSignal and not shortTriggered
+        shortTriggered := true
+        longTriggered  := false
+        shortBreakout  := true
+        if showORB and showAlerts
+            breakoutLabel := label.new(bar_index, openingLow, "VENTA", color=color.red, textcolor=color.white, style=label.style_label_right, size=size.large)
+
+alertcondition(showORB and showAlerts and longBreakout,  title="Ruptura Alcista ORB",  message="Ruptura del Rango de Apertura: COMPRA (LONG) en {{close}}")
+alertcondition(showORB and showAlerts and shortBreakout, title="Ruptura Bajista ORB", message="Ruptura del Rango de Apertura: VENTA (SHORT) en {{close}}")
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                     VWAP                     ║
+// ╚══════════════════════════════════════════════╝
+
+// VWAP diario: se reinicia al comenzar cada día
+vwapDaily = ta.vwap(hlc3, timeframe.change("D"))
+
+// VWAP NY: se reinicia a las 9:30 NY y solo se dibuja en la sesión regular
+nySession = time(timeframe.period, "0930-1600", "America/New_York")
+nyStart   = not na(nySession) and na(nySession[1])
+vwapNY    = ta.vwap(hlc3, nyStart)
+
+plot(vwapDaily, color=color.gray, linewidth=1, title="VWAP Diario", linestyle=plot.linestyle_dashed)
+plot(na(nySession) ? na : vwapNY, color=color.rgb(135, 206, 235), linewidth=1, title="VWAP NY")

@@ -1,0 +1,469 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © albertocorderoulab
+
+//@version=6
+indicator("NASDAQ HEDGE FUND SCALPING V1", shorttitle="Mike_Setup", overlay=true, max_labels_count=500)
+
+// ╔══════════════════════════════════════════════╗
+// ║               CONFIGURACIÓN                  ║
+// ╚══════════════════════════════════════════════╝
+
+grupo_scalping = "── ALERTAS ──"
+showScalping = input.bool(true, "Mostrar Scalping",   group=grupo_scalping)
+showBuy100  = input.bool(true, "Compra 100%", group=grupo_scalping)
+showBuy75   = input.bool(true, "Compra 75%", group=grupo_scalping)
+showSell100 = input.bool(true, "Venta 100%", group=grupo_scalping)
+showSell75  = input.bool(true, "Venta 75%", group=grupo_scalping)
+
+emaFastLen = 9
+emaMidLen  = 21
+emaSlowLen = 50
+
+volMultiplier = 2.0
+rsiLen        = 14
+useSession    = true
+useATR        = true
+useHTF        = true
+htfTF         = "15"
+
+vixBullThr = 20.0
+vixBearThr = 22.0
+
+slMult   = 1.0
+tpMult   = 2.0
+maxDaily = 100
+
+// ╔══════════════════════════════════════════════╗
+// ║             DATOS DE MERCADO                 ║
+// ╚══════════════════════════════════════════════╝
+
+// VIX en Diario para evitar valores 'na' en temporalidades pequeñas de Scalping
+vix = request.security("CBOE:VIX", "D", close)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║             TENDENCIA EMA                    ║
+// ╚══════════════════════════════════════════════╝
+
+emaFast   = ta.ema(close, emaFastLen)
+emaMid    = ta.ema(close, emaMidLen)
+emaSlow   = ta.ema(close, emaSlowLen)
+trendBull = emaFast > emaMid and emaMid > emaSlow
+trendBear = emaFast < emaMid and emaMid < emaSlow
+
+
+// ╔══════════════════════════════════════════════╗
+// ║             MOMENTUM                         ║
+// ╚══════════════════════════════════════════════╝
+
+rsi = ta.rsi(close, rsiLen)
+[macdLine, macdSignal, macdHist] = ta.macd(close, 12, 26, 9)
+momentumBull = rsi > 55 and macdLine > macdSignal
+momentumBear = rsi < 45 and macdLine < macdSignal
+
+
+// ╔══════════════════════════════════════════════╗
+// ║          VOLUMEN INSTITUCIONAL               ║
+// ╚══════════════════════════════════════════════╝
+
+volMA               = ta.sma(volume, 20)
+institutionalVolume = volume > volMA * volMultiplier
+priceImpulseUp      = close > open and close > close[1]
+priceImpulseDown    = close < open and close < close[1]
+
+
+// ╔═════════════════════════════════════════════════╗
+// ║               FILTRO VIX                        ║
+// ║  < vixBullThr → Alcista | > vixBearThr → Bajista║
+// ║         Zona intermedia → NEUTRO                ║
+// ╚═════════════════════════════════════════════════╝
+
+vixBull = not na(vix) and vix < vixBullThr
+vixBear = not na(vix) and vix > vixBearThr
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                FILTRO ATR                    ║
+// ╚══════════════════════════════════════════════╝
+
+atr       = ta.atr(14)
+atrMA     = ta.sma(atr, 50)
+atrFilter = not useATR or atr > atrMA * 0.8
+
+
+// ╔══════════════════════════════════════════════╗
+// ║            FILTRO DE SESIÓN (RTH NY)         ║
+// ╚══════════════════════════════════════════════╝
+
+inSession = not useSession or not na(time(timeframe.period, "0930-1600", "America/New_York"))
+
+
+// ╔══════════════════════════════════════════════╗
+// ║        CONFIRMACIÓN HTF (Anti-repintado)     ║
+// ╚══════════════════════════════════════════════╝
+
+[htfFast, htfSlow] = request.security(
+     syminfo.tickerid, htfTF,
+     [ta.ema(close, emaFastLen), ta.ema(close, emaSlowLen)],
+     lookahead=barmerge.lookahead_off)
+
+htfBull   = htfFast > htfSlow
+htfBear   = htfFast < htfSlow
+htfOkBuy  = not useHTF or htfBull
+htfOkSell = not useHTF or htfBear
+
+
+// ╔══════════════════════════════════════════════╗
+// ║         SISTEMA DE PUNTUACIÓN (SCORING)      ║
+// ╚══════════════════════════════════════════════╝
+
+int buyers  = 0
+int sellers = 0
+
+buyers  += trendBull                                ? 25 : 0
+buyers  += momentumBull                             ? 25 : 0
+buyers  += institutionalVolume and priceImpulseUp   ? 25 : 0
+buyers  += vixBull                                  ? 25 : 0
+
+sellers += trendBear                                ? 25 : 0
+sellers += momentumBear                             ? 25 : 0
+sellers += institutionalVolume and priceImpulseDown ? 25 : 0
+sellers += vixBear                                  ? 25 : 0
+
+
+// ╔══════════════════════════════════════════════╗
+// ║         CONTADOR DIARIO DE SEÑALES           ║
+// ╚══════════════════════════════════════════════╝
+
+var int buyCnt  = 0
+var int sellCnt = 0
+var int lastDay = 0
+
+if dayofmonth != lastDay
+    buyCnt  := 0
+    sellCnt := 0
+    lastDay := dayofmonth
+
+
+// ╔═══════════════════════════════════════════════════╗
+// ║   SEÑALES (barstate.isconfirmed → Sin repintar)   ║
+// ╚═══════════════════════════════════════════════════╝
+
+buyBase  = barstate.isconfirmed and buyers  >= 75 and atrFilter and inSession and htfOkBuy  and buyCnt  < maxDaily
+sellBase = barstate.isconfirmed and sellers >= 75 and atrFilter and inSession and htfOkSell and sellCnt < maxDaily
+
+fullBuy  = buyBase  and buyers  == 100
+fullSell = sellBase and sellers == 100
+
+if buyBase
+    buyCnt += 1
+if sellBase
+    sellCnt += 1
+
+
+// ╔══════════════════════════════════════════════╗
+// ║            SL / TP AUTOMÁTICOS               ║
+// ╚══════════════════════════════════════════════╝
+// condicionales de cuando mostrar SL/TP en el gráfico (solo si se activa la opción de Scalping)
+sigBuy100  = showScalping and showBuy100  and fullBuy
+sigBuy75   = showScalping and showBuy75   and buyBase  and not fullBuy
+sigSell100 = showScalping and showSell100 and fullSell
+sigSell75  = showScalping and showSell75  and sellBase and not fullSell
+
+slBuy  = low   - atr * slMult
+tpBuy  = close + atr * tpMult
+slSell = high  + atr * slMult
+tpSell = close - atr * tpMult
+
+// Etiquetas: aparecen cuando aparece cualquiera de los triángulos
+if sigBuy100 or sigBuy75
+    label.new(bar_index, slBuy, "SL",
+        color=color.new(color.fuchsia, 20), textcolor=color.white,
+        style=label.style_label_up, size=size.small)
+    label.new(bar_index, tpBuy, "TP ",
+        color=color.new(color.blue, 20), textcolor=color.white,
+        style=label.style_label_down, size=size.small)
+if sigSell100 or sigSell75
+    label.new(bar_index, slSell, "SL ",
+        color=color.new(color.fuchsia, 20), textcolor=color.white,
+        style=label.style_label_down, size=size.small)
+    label.new(bar_index, tpSell, "TP ",
+        color=color.new(color.blue, 20), textcolor=color.white,
+        style=label.style_label_up, size=size.small)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║         FLECHAS CON PUNTUACIÓN               ║
+// ╚══════════════════════════════════════════════╝
+
+plotshape(sigBuy100,
+     location=location.belowbar, style=shape.triangleup,
+     color=color.lime, size=size.large, editable=false,
+     text="COMPRA 100%", title="Compra 100%")
+
+plotshape(sigBuy75,
+     location=location.belowbar, style=shape.triangleup,
+     color=color.new(color.lime, 40), size=size.normal, editable=false,
+     text="COMPRA 75%", title="Compra 75%")
+
+plotshape(sigSell100,
+     location=location.abovebar, style=shape.triangledown,
+     color=color.red, size=size.large, editable=false,
+     text="VENTA 100%", title="Venta 100%")
+
+plotshape(sigSell75,
+     location=location.abovebar, style=shape.triangledown,
+     color=color.new(color.red, 40), size=size.normal, editable=false,
+     text="VENTA 75%", title="Venta 75%")
+
+
+// ╔══════════════════════════════════════════════╗
+// ║            LÍNEAS EMA                        ║
+// ╚══════════════════════════════════════════════╝
+
+plot(emaFast, color=color.blue,    linewidth=2, title="EMA 9", editable=false)
+plot(emaMid,  color=color.orange,  linewidth=2, title="EMA 21", linestyle=plot.linestyle_dashed, editable=false)
+plot(emaSlow, color=color.fuchsia, linewidth=1, title="EMA 50", editable=false)
+plot(atr,     color=color.yellow,  linewidth=1, title="ATR", editable=false)
+
+// ╔══════════════════════════════════════════════╗
+// ║            MAPA DE CALOR (HEATMAP)           ║
+// ╚══════════════════════════════════════════════╝
+
+bgcolor(inSession and buyers > sellers  ? color.new(color.green, 95) :
+        inSession and sellers > buyers  ? color.new(color.red,   95) : na, editable=false)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║         FUNCIÓN BARRA DE PUNTUACIÓN          ║
+// ╚══════════════════════════════════════════════╝
+
+scoreBar(score) =>
+    filled = math.round(score / 25)
+    result = ""
+    for i = 1 to 4
+        result := result + (i <= filled ? "█" : "░")
+    result
+
+
+// ╔══════════════════════════════════════════════╗
+// ║           PANEL DE CONTROL (DASHBOARD)       ║
+// ╚══════════════════════════════════════════════╝
+
+var table dash = table.new(
+     position.top_right, 2, 10,
+     border_width=1, border_color=color.new(color.gray, 50))
+
+if barstate.islast
+    // Paleta de colores
+    greenDark  = color.new(color.green,  20)
+    greenLight = color.new(color.green,  55)
+    redDark    = color.new(color.red,    20)
+    redLight   = color.new(color.red,    55)
+    grayDark   = color.new(color.gray,   20)
+    grayLight  = color.new(color.gray,   55)
+    orange     = color.new(color.orange, 55)
+
+    // ── Cabecera ──
+    table.cell(dash, 0, 0, "INDICADOR", bgcolor=grayDark,  text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "ESTADO",    bgcolor=grayDark,  text_color=color.white, text_size=size.small)
+
+    // ── Compradores ──
+    bCol = buyers >= 75 ? greenDark : greenLight
+    table.cell(dash, 0, 1, "COMPRADORES", bgcolor=bCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, scoreBar(buyers)  + "  " + str.tostring(buyers)  + "%", bgcolor=bCol, text_color=color.white, text_size=size.small)
+
+    // ── Vendedores ──
+    sCol = sellers >= 75 ? redDark : redLight
+    table.cell(dash, 0, 2, "VENDEDORES",  bgcolor=sCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, scoreBar(sellers) + "  " + str.tostring(sellers) + "%", bgcolor=sCol, text_color=color.white, text_size=size.small)
+
+    // ── VIX ──
+    vCol = vixBull ? greenLight : vixBear ? redLight : orange
+    vLbl = vixBull ? "ALCISTA" : vixBear ? "BAJISTA" : "NEUTRO"
+    table.cell(dash, 0, 3, "VIX",         bgcolor=vCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(math.round(nz(vix), 2)) + "  (" + vLbl + ")", bgcolor=vCol, text_color=color.white, text_size=size.small)
+
+    // ── Smart Money ──
+    smCol = institutionalVolume ? greenLight : grayLight
+    table.cell(dash, 0, 4, "SMART MONEY", bgcolor=smCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, institutionalVolume ? "ACTIVO  ✓" : "DÉBIL", bgcolor=smCol, text_color=color.white, text_size=size.small)
+
+    // ── Tendencia LTF ──
+    trCol = trendBull ? greenLight : trendBear ? redLight : grayLight
+    trLbl = trendBull ? "ALCISTA  ▲" : trendBear ? "BAJISTA  ▼" : "NEUTRO  —"
+    table.cell(dash, 0, 5, "TEND. LTF",  bgcolor=trCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, trLbl,        bgcolor=trCol, text_color=color.white, text_size=size.small)
+
+    // ── Tendencia HTF ──
+    htfCol = htfBull ? greenLight : redLight
+    htfLbl = htfBull ? "ALCISTA  ▲" : "BAJISTA  ▼"
+    table.cell(dash, 0, 6, "TEND. HTF " + htfTF + "m", bgcolor=htfCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, htfLbl,                      bgcolor=htfCol, text_color=color.white, text_size=size.small)
+
+    // ── Sesión ──
+    sessCol = inSession ? greenLight : grayLight
+    table.cell(dash, 0, 7, "SESIÓN",     bgcolor=sessCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, inSession ? "ACTIVA  ✓" : "CERRADA", bgcolor=sessCol, text_color=color.white, text_size=size.small)
+
+    // ── Filtro ATR ──
+    atrCol = atrFilter ? greenLight : redLight
+    table.cell(dash, 0, 8, "FILTRO ATR", bgcolor=atrCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, atrFilter ? "OK  ✓" : "VOL. BAJA", bgcolor=atrCol, text_color=color.white, text_size=size.small)
+
+    // ── Límite Diario ──
+    limitHit = buyCnt >= maxDaily and sellCnt >= maxDaily
+    dayCol   = limitHit ? redLight : grayDark
+    table.cell(dash, 0, 9, "SEÑALES/DÍA", bgcolor=dayCol, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9,
+         "C: " + str.tostring(buyCnt) + "  |  V: " + str.tostring(sellCnt) + "  /  " + str.tostring(maxDaily),
+         bgcolor=dayCol, text_color=color.white, text_size=size.small)
+
+
+// ╔══════════════════════════════════════════════╗
+// ║              ALERTAS EN ESPAÑOL              ║
+// ╚══════════════════════════════════════════════╝
+
+alertcondition(buyBase  and not fullBuy,  title="COMPRA 75%",   message="📈 NASDAQ COMPRA 75%  — {{ticker}} {{interval}}")
+alertcondition(fullBuy,                   title="COMPRA 100%",  message="🚀 NASDAQ COMPRA MÁXIMA CONVICCIÓN 100% — {{ticker}} {{interval}}")
+alertcondition(sellBase and not fullSell, title="VENTA 75%",    message="📉 NASDAQ VENTA 75%  — {{ticker}} {{interval}}")
+alertcondition(fullSell,                  title="VENTA 100%",   message="🔴 NASDAQ VENTA MÁXIMA CONVICCIÓN 100% — {{ticker}} {{interval}}")
+
+
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ ORB ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// ╔══════════════════════════════════════════════╗
+// ║               CONFIGURACIÓN                  ║
+// ╚══════════════════════════════════════════════╝
+grupo_orb = "── ORB ──"
+showORB = input.bool(true, "Mostrar ORB",   group=grupo_orb)
+
+rangeDuration    = 15
+showAlerts       = true
+showPriceLabels  = true
+showRangeFill    = true
+fillColor        = color.new(color.white, 90)
+
+highColor        = color.new(#ff00dd, 0)
+lowColor         = color.new(#ff00dd, 0)
+highThickness    = 4
+lowThickness     = 4
+
+// ╔══════════════════════════════════════════════╗
+// ║               HORA APERTURA                  ║
+// ╚══════════════════════════════════════════════╝
+var int sessionStartTime = 0
+var int sessionEndTime   = 0
+var int sessionCloseTime = 0   // 4:00 PM ET — borde derecho fijo para los dibujos del día
+isNewDay = dayofmonth != dayofmonth[1]
+
+if isNewDay
+    sessionStartTime := timestamp("America/New_York", year, month, dayofmonth, 9, 30)
+    sessionEndTime   := sessionStartTime + (rangeDuration * 60 * 1000)
+    sessionCloseTime := timestamp("America/New_York", year, month, dayofmonth, 16, 0)
+
+isInOpeningRange = time >= sessionStartTime and time < sessionEndTime
+
+// ╔══════════════════════════════════════════════╗
+// ║             Max/Min del ORB                  ║
+// ╚══════════════════════════════════════════════╝
+// Almacenamiento de máximos/mínimos del OR (guarda la HORA de los extremos para dibujos basados en tiempo)
+var float openingHigh = na
+var float openingLow  = na
+var int   highBarTime = na
+var int   lowBarTime  = na
+
+// Objetos de dibujo del día actual (los días anteriores persisten; las referencias se reinician cada día)
+var line  highRay        = na
+var line  lowRay         = na
+var box   rangeBox       = na
+var label breakoutLabel  = na
+var label missingLabel   = na
+var bool  longTriggered  = false
+var bool  shortTriggered = false
+
+// Reiniciar en un nuevo día — referencias nulas SIN eliminar, para que el historial persista
+if isNewDay
+    openingHigh    := na
+    openingLow     := na
+    highBarTime    := na
+    lowBarTime     := na
+    longTriggered  := false
+    shortTriggered := false
+    highRay        := na
+    lowRay         := na
+    rangeBox       := na
+    breakoutLabel  := na
+    missingLabel   := na
+
+// Actualizar máximo/mínimo durante el Rango de Apertura
+if isInOpeningRange
+    if na(openingHigh) or high > openingHigh
+        openingHigh := high
+        highBarTime := time
+    if na(openingLow) or low < openingLow
+        openingLow := low
+        lowBarTime := time
+
+// Fin del rango de apertura — dibuja líneas y relleno proyectados hasta las 4:00 PM ET
+isOpeningRangeEnd = ta.change(isInOpeningRange) and not isInOpeningRange
+if isOpeningRangeEnd
+    if showORB and (na(openingHigh) or na(openingLow))
+        missingLabel := label.new(bar_index, high, "Faltan datos para el Rango de Apertura", color=color.red, style=label.style_label_down, textcolor=color.white)
+
+    if showORB and not na(openingHigh)
+        highRay := line.new(highBarTime, openingHigh, sessionCloseTime, openingHigh, xloc=xloc.bar_time, color=highColor, width=highThickness)
+
+    if showORB and not na(openingLow)
+        lowRay := line.new(lowBarTime, openingLow, sessionCloseTime, openingLow, xloc=xloc.bar_time, color=lowColor, width=lowThickness)
+
+    if showORB and showRangeFill and not na(openingHigh) and not na(openingLow)
+        rangeBox := box.new(left=time, top=openingHigh, right=sessionCloseTime, bottom=openingLow, xloc=xloc.bar_time, bgcolor=fillColor, border_width=0)
+
+// Gráficos de color para etiquetas de escala de precios (día actual)
+plotHigh = showPriceLabels and not na(openingHigh) and barstate.islast ? openingHigh : na
+plotLow  = showPriceLabels and not na(openingLow)  and barstate.islast ? openingLow  : na
+
+
+// ╔══════════════════════════════════════════════╗
+// ║             RUPTURAS DEL ORB                 ║
+// ╚══════════════════════════════════════════════╝
+// === Detección de rupturas (temporalidad del gráfico, se activa al cierre de barra, compatible con gap-and-go) ===
+longBreakoutSignal  = close > openingHigh
+shortBreakoutSignal = close < openingLow
+
+bool longBreakout  = false
+bool shortBreakout = false
+
+if not isInOpeningRange and time >= sessionEndTime and not na(openingHigh) and not na(openingLow) and barstate.isconfirmed
+    if longBreakoutSignal and not longTriggered
+        longTriggered  := true
+        shortTriggered := false
+        longBreakout   := true
+        if showORB and showAlerts
+            breakoutLabel := label.new(bar_index, openingHigh, "COMPRA", color=color.green, textcolor=color.white, style=label.style_label_right, size=size.large)
+
+    if shortBreakoutSignal and not shortTriggered
+        shortTriggered := true
+        longTriggered  := false
+        shortBreakout  := true
+        if showORB and showAlerts
+            breakoutLabel := label.new(bar_index, openingLow, "VENTA", color=color.red, textcolor=color.white, style=label.style_label_right, size=size.large)
+
+alertcondition(showORB and showAlerts and longBreakout,  title="Ruptura Alcista ORB",  message="Ruptura del Rango de Apertura: COMPRA (LONG) en {{close}}")
+alertcondition(showORB and showAlerts and shortBreakout, title="Ruptura Bajista ORB", message="Ruptura del Rango de Apertura: VENTA (SHORT) en {{close}}")
+
+
+// ╔══════════════════════════════════════════════╗
+// ║                     VWAP                     ║
+// ╚══════════════════════════════════════════════╝
+
+// VWAP diario: se reinicia al comenzar cada día
+vwapDaily = ta.vwap(hlc3, timeframe.change("D"))
+
+// VWAP NY: se reinicia a las 9:30 NY y solo se dibuja en la sesión regular
+nySession = time(timeframe.period, "0930-1600", "America/New_York")
+nyStart   = not na(nySession) and na(nySession[1])
+vwapNY    = ta.vwap(hlc3, nyStart)
+
+plot(vwapDaily, color=color.gray, linewidth=1, title="VWAP Diario", linestyle=plot.linestyle_dashed, editable=false)
+plot(na(nySession) ? na : vwapNY, color=color.rgb(135, 206, 235), linewidth=1, title="VWAP NY", editable=false)
