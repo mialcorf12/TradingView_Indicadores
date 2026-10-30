@@ -1,0 +1,70 @@
+//@version=6
+// 1. Opening Range Breakout (ORB) — NQ/MNQ, timeframe recomendado: 5 min
+strategy("01 ORB NQ (Prop)", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.0, slippage=1)
+
+// ---------- Inputs ----------
+tz        = "America/New_York"
+orSessIn  = input.session("0930-0945", "Opening range")
+entryWin  = input.session("0945-1130", "Ventana de entrada")
+rrTarget  = input.float(2.0, "Target (R)", step=0.5)
+atrLen    = input.int(14, "ATR")
+atrMaLen  = input.int(100, "Media ATR (filtro volatilidad)")
+dll       = input.float(500,  "Daily loss limit interno ($)")
+dcap      = input.float(1000, "Cap de ganancia diaria ($)")
+
+// ---------- Sesión / prop-firm guard ----------
+inOR    = not na(time(timeframe.period, orSessIn, tz))
+inEntry = not na(time(timeframe.period, entryWin, tz))
+flatTm  = not na(time(timeframe.period, "1555-1600", tz))
+newDay  = timeframe.change("D")
+
+var float dayStart = 0.0
+var int   tradesToday = 0
+if newDay
+    dayStart := strategy.netprofit
+    tradesToday := 0
+dailyPnl = strategy.netprofit + strategy.openprofit - dayStart
+canTrade = dailyPnl > -dll and dailyPnl < dcap and not flatTm
+
+// ---------- Opening range ----------
+var float orH = na
+var float orL = na
+if newDay
+    orH := na
+    orL := na
+if inOR
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low  : math.min(orL, low)
+
+atr       = ta.atr(atrLen)
+atrFilter = atr > ta.sma(atr, atrMaLen)
+rng       = orH - orL
+flat      = strategy.position_size == 0
+
+// ---------- Entradas ----------
+longSig  = inEntry and canTrade and flat and atrFilter and tradesToday == 0 and close > orH and close[1] <= orH
+shortSig = inEntry and canTrade and flat and atrFilter and tradesToday == 0 and close < orL and close[1] >= orL
+
+if longSig
+    stopPx = rng > 1.5 * atr ? close - rng * 0.5 : orL
+    risk   = close - stopPx
+    strategy.entry("L", strategy.long)
+    strategy.exit("LX", "L", stop=stopPx, limit=close + rrTarget * risk)
+    tradesToday += 1
+
+if shortSig
+    stopPx = rng > 1.5 * atr ? close + rng * 0.5 : orH
+    risk   = stopPx - close
+    strategy.entry("S", strategy.short)
+    strategy.exit("SX", "S", stop=stopPx, limit=close - rrTarget * risk)
+    tradesToday += 1
+
+// ---------- Salidas por tiempo ----------
+if (not inEntry and not inOR) or flatTm
+    strategy.close_all("Time exit")
+
+// ---------- Plots ----------
+plot(orH, "OR High", color=color.green, style=plot.style_linebr)
+plot(orL, "OR Low",  color=color.red,   style=plot.style_linebr)
+bgcolor(canTrade ? na : color.new(color.red, 90))

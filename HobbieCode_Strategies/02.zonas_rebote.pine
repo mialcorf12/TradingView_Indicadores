@@ -1,0 +1,392 @@
+//@version=6
+indicator("Zonas de Rebote por Probabilidad", shorttitle = "Zonas Rebote", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+// ═════════════════════════ INPUTS ═════════════════════════
+G1 = "Detección"
+pivLen   = input.int(5, "Longitud de pivote (izq/der)", minval = 2, group = G1)
+lookback = input.int(400, "Barras a analizar", minval = 50, maxval = 4500, group = G1)
+atrLen   = input.int(14, "Periodo ATR", minval = 1, group = G1)
+
+G2 = "Niveles S/R"
+zoneMult = input.float(0.25, "Semiancho de zona (× ATR)", minval = 0.05, step = 0.05, group = G2)
+minPivSR = input.int(2, "Mín. pivotes por nivel", minval = 1, group = G2)
+
+G3 = "Líneas de tendencia"
+tlMult   = input.float(0.15, "Tolerancia de toque (× ATR)", minval = 0.01, step = 0.05, group = G3)
+maxTL    = input.int(3, "Máx. líneas por lado", minval = 1, maxval = 10, group = G3)
+minTchTL = input.int(3, "Mín. toques", minval = 2, group = G3)
+pivDepth = input.int(12, "Pivotes recientes a combinar", minval = 3, maxval = 30, group = G3)
+
+G4 = "Zonas de rebote"
+maxPerSide = input.int(2, "Zonas por lado", minval = 1, maxval = 5, group = G4)
+minProb    = input.int(55, "Probabilidad mínima (%)", minval = 0, maxval = 95, group = G4)
+maxDist    = input.float(8.0, "Distancia máx. al precio (× ATR)", minval = 1.0, step = 0.5, group = G4)
+zoneBack   = input.int(40, "Barras visibles hacia atrás", minval = 5, maxval = 300, group = G4)
+
+G5 = "Visual"
+showTbl   = input.bool(true, "Mostrar tabla de decisión", group = G5)
+showSig   = input.bool(true, "Marcar velas de rebote (▲/▼)", group = G5)
+showTLs   = input.bool(false, "Mostrar líneas de tendencia de apoyo", group = G5)
+supWeak   = input.color(color.new(#81c784, 40), "Soporte débil", inline = "s", group = G5)
+supStrong = input.color(color.new(#00c853, 0), "fuerte", inline = "s", group = G5)
+resWeak   = input.color(color.new(#e57373, 40), "Resistencia débil", inline = "r", group = G5)
+resStrong = input.color(color.new(#d50000, 0), "fuerte", inline = "r", group = G5)
+
+// ═════════════════════════ PIVOTES ═════════════════════════
+atr = ta.atr(atrLen)
+ph  = ta.pivothigh(high, pivLen, pivLen)
+pl  = ta.pivotlow(low, pivLen, pivLen)
+
+var phP = array.new<float>()
+var phB = array.new<int>()
+var plP = array.new<float>()
+var plB = array.new<int>()
+
+if not na(ph)
+    phP.push(ph)
+    phB.push(bar_index - pivLen)
+if not na(pl)
+    plP.push(pl)
+    plB.push(bar_index - pivLen)
+
+while phB.size() > 0 and phB.first() < bar_index - lookback
+    phB.shift()
+    phP.shift()
+while plB.size() > 0 and plB.first() < bar_index - lookback
+    plB.shift()
+    plP.shift()
+
+var boxes   = array.new<box>()
+var lines   = array.new<line>()
+var labels  = array.new<label>()
+var sigLbls = array.new<label>()
+var int  lastSigBar = -1
+var bool sigBuy  = false
+var bool sigSell = false
+var tbl = table.new(position.top_right, 4, 12, border_width = 1, border_color = color.new(color.gray, 70))
+
+// ═════════════════════════ CÁLCULO (última barra) ═════════════════════════
+if barstate.islast
+    while boxes.size() > 0
+        boxes.pop().delete()
+    while lines.size() > 0
+        lines.pop().delete()
+    while labels.size() > 0
+        labels.pop().delete()
+    sigBuy  := false
+    sigSell := false
+
+    tol   = atr * zoneMult
+    tlTol = atr * tlMult
+
+    // ───────── 1) LÍNEAS DE TENDENCIA (para confluencia) ─────────
+    cX1 = array.new<int>()
+    cY1 = array.new<float>()
+    cSl = array.new<float>()
+    cSc = array.new<float>()
+    cT  = array.new<int>()
+    cRc = array.new<float>()
+    cUp = array.new<bool>()
+
+    for side = 0 to 1
+        isLow = side == 0
+        pP = isLow ? plP : phP
+        pB = isLow ? plB : phB
+        m  = pP.size()
+        if m >= 2
+            startA = math.max(0, m - pivDepth)
+            for a = startA to m - 2
+                for b = a + 1 to m - 1
+                    x1      = pB.get(a)
+                    y1      = pP.get(a)
+                    slope   = (pP.get(b) - y1) / (pB.get(b) - x1)
+                    valid   = isLow ? slope > 0 : slope < 0
+                    touches = 0
+                    lastT   = x1 - 1000
+                    if valid
+                        for off = bar_index - x1 to 0
+                            bx = bar_index - off
+                            lv = y1 + slope * (bx - x1)
+                            broken = isLow ? close[off] < lv - tlTol : close[off] > lv + tlTol
+                            if broken
+                                valid := false
+                                break
+                            pr = isLow ? low[off] : high[off]
+                            if math.abs(pr - lv) <= tlTol and bx - lastT > pivLen
+                                touches += 1
+                                lastT := bx
+                    if valid and touches >= minTchTL
+                        lenF = float(bar_index - x1) / lookback
+                        recF = math.max(0.0, 1.0 - float(bar_index - lastT) / lookback)
+                        cX1.push(x1)
+                        cY1.push(y1)
+                        cSl.push(slope)
+                        cSc.push(touches * (0.7 + 0.3 * recF) + lenF)
+                        cT.push(touches)
+                        cRc.push(recF)
+                        cUp.push(isLow)
+
+    tX1   = array.new<int>()
+    tY1   = array.new<float>()
+    tNow  = array.new<float>()
+    tStr  = array.new<float>()
+    tRec  = array.new<float>()
+    tTch  = array.new<int>()
+    tUp   = array.new<bool>()
+    tUsed = array.new<bool>()
+
+    n2 = cSc.size()
+    if n2 > 0
+        taken = array.new<bool>(n2, false)
+        selI  = array.new<int>()
+        cntUp = 0
+        cntDn = 0
+        for t = 1 to n2
+            best  = -1
+            bestS = -1.0
+            for i = 0 to n2 - 1
+                if not taken.get(i) and cSc.get(i) > bestS
+                    best  := i
+                    bestS := cSc.get(i)
+            if best < 0
+                break
+            taken.set(best, true)
+            up = cUp.get(best)
+            if (up and cntUp >= maxTL) or (not up and cntDn >= maxTL)
+                continue
+            nowV = cY1.get(best) + cSl.get(best) * (bar_index - cX1.get(best))
+            dup = false
+            for j in selI
+                nowJ = cY1.get(j) + cSl.get(j) * (bar_index - cX1.get(j))
+                if cUp.get(j) == up and math.abs(nowV - nowJ) < tlTol * 3
+                    dup := true
+                    break
+            if not dup
+                selI.push(best)
+                if up
+                    cntUp += 1
+                else
+                    cntDn += 1
+
+        if selI.size() > 0
+            maxTS = cSc.get(selI.first())
+            for i in selI
+                tX1.push(cX1.get(i))
+                tY1.push(cY1.get(i))
+                tNow.push(cY1.get(i) + cSl.get(i) * (bar_index - cX1.get(i)))
+                tStr.push(cSc.get(i) / maxTS)
+                tRec.push(cRc.get(i))
+                tTch.push(cT.get(i))
+                tUp.push(cUp.get(i))
+                tUsed.push(false)
+    nT = tNow.size()
+
+    // ───────── 2) NIVELES S/R ─────────
+    allP = phP.copy()
+    allP.concat(plP)
+    allB = phB.copy()
+    allB.concat(plB)
+    n = allP.size()
+
+    lvP   = array.new<float>()
+    lvRaw = array.new<float>()
+    lvC   = array.new<int>()
+    lvR   = array.new<int>()
+    lvK   = array.new<int>()
+    lvRec = array.new<float>()
+
+    if n > 0
+        used = array.new<bool>(n, false)
+        for i = 0 to n - 1
+            if not used.get(i)
+                seed  = allP.get(i)
+                sum   = 0.0
+                cnt   = 0
+                lastB = 0
+                for j = i to n - 1
+                    if not used.get(j) and math.abs(allP.get(j) - seed) <= tol * 2
+                        used.set(j, true)
+                        sum += allP.get(j)
+                        cnt += 1
+                        lastB := math.max(lastB, allB.get(j))
+                if cnt >= minPivSR
+                    lvl  = sum / cnt
+                    zTop = lvl + tol
+                    zBot = lvl - tol
+                    rej  = 0
+                    brk  = 0
+                    prevSide = 0
+                    lim  = math.min(lookback, bar_index)
+                    if lim > 0
+                        for k = lim - 1 to 0
+                            c  = close[k]
+                            sd = c > zTop ? 1 : c < zBot ? -1 : 0
+                            if sd != 0
+                                if prevSide != 0 and sd != prevSide
+                                    brk += 1
+                                prevSide := sd
+                            touched  = high[k] >= zBot and low[k] <= zTop
+                            rejected = (open[k] > zTop and close[k] > zTop) or (open[k] < zBot and close[k] < zBot)
+                            if touched and rejected
+                                rej += 1
+                                lastB := math.max(lastB, bar_index - k)
+                    rec = math.max(0.0, 1.0 - float(bar_index - lastB) / lookback)
+                    lvP.push(lvl)
+                    lvRaw.push((cnt * 2 + rej) * (0.6 + 0.4 * rec))
+                    lvC.push(cnt)
+                    lvR.push(rej)
+                    lvK.push(brk)
+                    lvRec.push(rec)
+
+    // ───────── 3) PUNTUACIÓN DE ZONAS ─────────
+    // Prob = 40% fuerza S/R + 25% tasa de sostenimiento + 20% confluencia con tendencias + 15% recencia
+    zMid  = array.new<float>()
+    zProb = array.new<float>()
+    zTag  = array.new<string>()
+    zInfo = array.new<string>()
+
+    nL = lvP.size()
+    if nL > 0
+        maxRaw = lvRaw.max()
+        for i = 0 to nL - 1
+            lvl   = lvP.get(i)
+            conf  = 0
+            hasUp = false
+            hasDn = false
+            if nT > 0
+                for t = 0 to nT - 1
+                    if math.abs(tNow.get(t) - lvl) <= tol + tlTol
+                        conf += 1
+                        tUsed.set(t, true)
+                        if tUp.get(t)
+                            hasUp := true
+                        else
+                            hasDn := true
+            rej  = lvR.get(i)
+            brk  = lvK.get(i)
+            base = lvRaw.get(i) / maxRaw
+            hold = (rej + 1.0) / (rej + brk + 2.0)
+            prob = 100 * (0.40 * base + 0.25 * hold + 0.20 * math.min(conf, 2) / 2.0 + 0.15 * lvRec.get(i))
+            zMid.push(lvl)
+            zProb.push(prob)
+            zTag.push("S/R" + (hasUp ? " + TL↑" : "") + (hasDn ? " + TL↓" : ""))
+            zInfo.push(str.tostring(lvC.get(i)) + " pivotes · " + str.tostring(rej) + " rechazos · " + str.tostring(brk) + " rupturas")
+
+    // Tendencias sin nivel S/R cercano → zona propia (máx. ~74%)
+    if nT > 0
+        for t = 0 to nT - 1
+            if not tUsed.get(t)
+                tch  = tTch.get(t)
+                hold = (tch + 1.0) / (tch + 2.0)
+                prob = 100 * (0.40 * tStr.get(t) * 0.85 + 0.25 * hold + 0.15 * tRec.get(t))
+                zMid.push(tNow.get(t))
+                zProb.push(prob)
+                zTag.push(tUp.get(t) ? "TL↑" : "TL↓")
+                zInfo.push(str.tostring(tch) + " toques en la tendencia")
+
+    // ───────── 4) SELECCIÓN: mejores zonas por lado, cerca del precio ─────────
+    selZ = array.new<int>()
+    nz   = zMid.size()
+    if nz > 0
+        for side = 0 to 1
+            isSupSide = side == 0
+            taken = array.new<bool>(nz, false)
+            for r = 1 to maxPerSide
+                best  = -1
+                bestP = -1.0
+                for i = 0 to nz - 1
+                    mid = zMid.get(i)
+                    ok  = not taken.get(i) and (isSupSide ? mid < close : mid >= close) and zProb.get(i) >= minProb and math.abs(mid - close) <= maxDist * atr
+                    if ok and zProb.get(i) > bestP
+                        best  := i
+                        bestP := zProb.get(i)
+                if best >= 0
+                    taken.set(best, true)
+                    selZ.push(best)
+
+    ns = selZ.size()
+    if ns > 1
+        for i = 0 to ns - 2
+            for j = i + 1 to ns - 1
+                if zMid.get(selZ.get(j)) > zMid.get(selZ.get(i))
+                    tmp = selZ.get(i)
+                    selZ.set(i, selZ.get(j))
+                    selZ.set(j, tmp)
+
+    // ───────── 5) DIBUJO ─────────
+    newSig = false
+    for idx in selZ
+        mid   = zMid.get(idx)
+        p     = zProb.get(idx)
+        isSup = mid < close
+        s     = math.max(0.0, math.min(1.0, (p - minProb) / math.max(1.0, 100.0 - minProb)))
+        col   = isSup ? color.from_gradient(s, 0, 1, supWeak, supStrong) : color.from_gradient(s, 0, 1, resWeak, resStrong)
+        zTop  = mid + tol
+        zBot  = mid - tol
+        boxes.push(box.new(bar_index - zoneBack, zTop, bar_index + 15, zBot, border_color = col, border_width = p >= 75 ? 2 : 1, bgcolor = color.new(col, 85 - 35 * s)))
+        txt = (isSup ? "▲ SOPORTE " : "▼ RESISTENCIA ") + str.tostring(math.round(p)) + "%  ·  " + zTag.get(idx)
+        labels.push(label.new(bar_index + 15, mid, txt, style = label.style_label_left, color = color.new(col, 15), textcolor = color.white, size = size.small, tooltip = zInfo.get(idx)))
+
+        // Rebote confirmado en la vela anterior: mecha dentro de la zona y cierre fuera, a favor del rebote
+        if isSup and low[1] <= zTop and close[1] > zTop
+            sigBuy := true
+            if showSig and bar_index - 1 != lastSigBar
+                sigLbls.push(label.new(bar_index - 1, low[1], "▲", yloc = yloc.belowbar, style = label.style_label_up, color = supStrong, textcolor = color.white, size = size.small))
+                newSig := true
+        if not isSup and high[1] >= zBot and close[1] < zBot
+            sigSell := true
+            if showSig and bar_index - 1 != lastSigBar
+                sigLbls.push(label.new(bar_index - 1, high[1], "▼", yloc = yloc.abovebar, style = label.style_label_down, color = resStrong, textcolor = color.white, size = size.small))
+                newSig := true
+    if newSig
+        lastSigBar := bar_index - 1
+    while sigLbls.size() > 50
+        sigLbls.shift().delete()
+
+    if showTLs and nT > 0
+        for t = 0 to nT - 1
+            colT = tUp.get(t) ? color.new(#2962ff, 40) : color.new(#ff6d00, 40)
+            lines.push(line.new(tX1.get(t), tY1.get(t), bar_index, tNow.get(t), extend = extend.right, color = colT, width = 1, style = line.style_dotted))
+
+    // ───────── 6) TABLA DE DECISIÓN ─────────
+    if showTbl
+        tbl.clear(0, 0, 3, 11)
+        hdrBg = color.new(color.gray, 60)
+        tbl.cell(0, 0, "Zona", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+        tbl.cell(1, 0, "Rango", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+        tbl.cell(2, 0, "Prob.", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+        tbl.cell(3, 0, "Distancia", text_color = color.white, bgcolor = hdrBg, text_size = size.small)
+        row = 1
+        priceDone = false
+        for k = 0 to ns
+            isPriceRow = false
+            if k == ns
+                isPriceRow := not priceDone
+            else if not priceDone and zMid.get(selZ.get(k)) < close
+                isPriceRow := true
+            if isPriceRow
+                priceDone := true
+                tbl.cell(0, row, "PRECIO", text_color = color.white, bgcolor = color.new(color.blue, 50), text_size = size.small)
+                tbl.cell(1, row, str.tostring(close, format.mintick), text_color = color.white, bgcolor = color.new(color.blue, 50), text_size = size.small)
+                tbl.cell(2, row, "", bgcolor = color.new(color.blue, 50))
+                tbl.cell(3, row, "", bgcolor = color.new(color.blue, 50))
+                row += 1
+            if k < ns
+                idx   = selZ.get(k)
+                mid   = zMid.get(idx)
+                p     = zProb.get(idx)
+                isSup = mid < close
+                zTop  = mid + tol
+                zBot  = mid - tol
+                bg    = isSup ? color.new(#00c853, p >= 75 ? 30 : 65) : color.new(#d50000, p >= 75 ? 30 : 65)
+                inZone = close <= zTop and close >= zBot
+                dist  = inZone ? "EN ZONA" : str.tostring(math.abs(mid - close) / atr, "#.#") + " ATR"
+                tbl.cell(0, row, (isSup ? "Soporte · " : "Resist. · ") + zTag.get(idx), text_color = color.white, bgcolor = bg, text_size = size.small)
+                tbl.cell(1, row, str.tostring(zBot, format.mintick) + " – " + str.tostring(zTop, format.mintick), text_color = color.white, bgcolor = bg, text_size = size.small)
+                tbl.cell(2, row, str.tostring(math.round(p)) + "%", text_color = color.white, bgcolor = bg, text_size = size.small)
+                tbl.cell(3, row, dist, text_color = inZone ? color.yellow : color.white, bgcolor = bg, text_size = size.small)
+                row += 1
+
+// ═════════════════════════ ALERTAS ═════════════════════════
+alertcondition(sigBuy, "Rebote en soporte", "Posible rebote alcista en zona de soporte de alta probabilidad")
+alertcondition(sigSell, "Rechazo en resistencia", "Posible rechazo bajista en zona de resistencia de alta probabilidad")

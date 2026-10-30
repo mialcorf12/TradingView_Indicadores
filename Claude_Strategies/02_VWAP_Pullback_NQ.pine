@@ -1,0 +1,61 @@
+//@version=6
+// 2. Pullback a VWAP en día de tendencia — NQ/MNQ, timeframe: 1 min (filtro en 5 min)
+strategy("02 VWAP Pullback NQ (Prop)", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.0, slippage=1)
+
+// ---------- Inputs ----------
+tz        = "America/New_York"
+entryWin  = input.session("1000-1200", "Ventana de entrada")
+rrTarget  = input.float(1.5, "Target (R)", step=0.5)
+atrLen    = input.int(14, "ATR (1m)")
+dll       = input.float(500,  "Daily loss limit interno ($)")
+dcap      = input.float(1000, "Cap de ganancia diaria ($)")
+
+// ---------- Guard ----------
+inEntry = not na(time(timeframe.period, entryWin, tz))
+flatTm  = not na(time(timeframe.period, "1555-1600", tz))
+newDay  = timeframe.change("D")
+var float dayStart = 0.0
+if newDay
+    dayStart := strategy.netprofit
+dailyPnl = strategy.netprofit + strategy.openprofit - dayStart
+canTrade = dailyPnl > -dll and dailyPnl < dcap and not flatTm
+flat     = strategy.position_size == 0
+
+// ---------- VWAP con bandas (reset diario) ----------
+[vwap, vUp, vLo] = ta.vwap(hlc3, newDay, 1)
+
+// ---------- Filtro de tendencia en 5 min ----------
+ema20_5 = request.security(syminfo.tickerid, "5", ta.ema(close, 20))
+ema50_5 = request.security(syminfo.tickerid, "5", ta.ema(close, 50))
+upTrend = close > vwap and ema20_5 > ema50_5
+dnTrend = close < vwap and ema20_5 < ema50_5
+
+atr = ta.atr(atrLen)
+
+// ---------- Señales: vela toca VWAP y cierra del lado de la tendencia ----------
+longSig  = inEntry and canTrade and flat and upTrend and low  <= vwap and close > vwap and close > open
+shortSig = inEntry and canTrade and flat and dnTrend and high >= vwap and close < vwap and close < open
+
+if longSig
+    stopPx = vwap - atr
+    risk   = close - stopPx
+    tgt    = math.min(vUp, close + rrTarget * risk)
+    strategy.entry("L", strategy.long)
+    strategy.exit("LX", "L", stop=stopPx, limit=tgt)
+
+if shortSig
+    stopPx = vwap + atr
+    risk   = stopPx - close
+    tgt    = math.max(vLo, close - rrTarget * risk)
+    strategy.entry("S", strategy.short)
+    strategy.exit("SX", "S", stop=stopPx, limit=tgt)
+
+if flatTm
+    strategy.close_all("Flat EOD")
+
+// ---------- Plots ----------
+plot(vwap, "VWAP", color=color.orange, linewidth=2)
+plot(vUp,  "VWAP +1σ", color=color.new(color.orange, 60))
+plot(vLo,  "VWAP -1σ", color=color.new(color.orange, 60))
+bgcolor(canTrade ? na : color.new(color.red, 90))

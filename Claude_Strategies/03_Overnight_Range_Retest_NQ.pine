@@ -1,0 +1,99 @@
+//@version=6
+// 3. Breakout del rango overnight (Globex) con retest — NQ/MNQ, timeframe: 5 min
+strategy("03 Overnight Range Retest NQ (Prop)", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.0, slippage=1)
+
+// ---------- Inputs ----------
+tz        = "America/New_York"
+onSessIn  = input.session("1800-0930", "Sesión overnight")
+entryWin  = input.session("0930-1200", "Ventana de entrada")
+rrTarget  = input.float(1.5, "Target (R)", step=0.5)
+stopAtrK  = input.float(0.75, "Stop (x ATR)", step=0.25)
+atrLen    = input.int(14, "ATR")
+dll       = input.float(500,  "Daily loss limit interno ($)")
+dcap      = input.float(1000, "Cap de ganancia diaria ($)")
+
+// ---------- Guard ----------
+inON    = not na(time(timeframe.period, onSessIn, tz))
+inEntry = not na(time(timeframe.period, entryWin, tz))
+flatTm  = not na(time(timeframe.period, "1555-1600", tz))
+newDay  = timeframe.change("D")
+var float dayStart = 0.0
+if newDay
+    dayStart := strategy.netprofit
+dailyPnl = strategy.netprofit + strategy.openprofit - dayStart
+canTrade = dailyPnl > -dll and dailyPnl < dcap and not flatTm
+flat     = strategy.position_size == 0
+
+// ---------- Rango overnight ----------
+var float onH = na
+var float onL = na
+onStart = inON and not inON[1]
+if onStart
+    onH := high
+    onL := low
+else if inON
+    onH := math.max(onH, high)
+    onL := math.min(onL, low)
+
+atr      = ta.atr(atrLen)
+dailyAtr = request.security(syminfo.tickerid, "D", ta.atr(14))
+rngOk    = (onH - onL) < dailyAtr
+
+// ---------- Máquina de estados: break -> retest -> confirmación ----------
+var bool brokeUp = false
+var bool retUp   = false
+var bool brokeDn = false
+var bool retDn   = false
+if onStart
+    brokeUp := false
+    retUp   := false
+    brokeDn := false
+    retDn   := false
+
+if inEntry
+    if close > onH
+        brokeUp := true
+    if brokeUp and low <= onH
+        retUp := true
+    if close < onL
+        brokeDn := true
+    if brokeDn and high >= onL
+        retDn := true
+
+longSig  = inEntry and canTrade and flat and rngOk and retUp and close > onH and close > open
+shortSig = inEntry and canTrade and flat and rngOk and retDn and close < onL and close < open
+
+if longSig
+    stopPx = onH - stopAtrK * atr
+    risk   = close - stopPx
+    strategy.entry("L", strategy.long)
+    strategy.exit("LX", "L", stop=stopPx, limit=close + rrTarget * risk)
+    retUp := false
+
+if shortSig
+    stopPx = onL + stopAtrK * atr
+    risk   = stopPx - close
+    strategy.entry("S", strategy.short)
+    strategy.exit("SX", "S", stop=stopPx, limit=close - rrTarget * risk)
+    retDn := false
+
+// Breakeven en 1R
+if strategy.position_size > 0
+    entryPx = strategy.position_avg_price
+    r = entryPx - (onH - stopAtrK * atr)
+    if close >= entryPx + r
+        strategy.exit("LX", "L", stop=entryPx, limit=entryPx + rrTarget * r)
+if strategy.position_size < 0
+    entryPx = strategy.position_avg_price
+    r = (onL + stopAtrK * atr) - entryPx
+    if close <= entryPx - r
+        strategy.exit("SX", "S", stop=entryPx, limit=entryPx - rrTarget * r)
+
+if flatTm or (not inEntry and not inON)
+    strategy.close_all("Time exit")
+
+// ---------- Plots ----------
+plot(onH, "ON High", color=color.aqua, style=plot.style_linebr)
+plot(onL, "ON Low",  color=color.fuchsia, style=plot.style_linebr)
+bgcolor(canTrade ? na : color.new(color.red, 90))

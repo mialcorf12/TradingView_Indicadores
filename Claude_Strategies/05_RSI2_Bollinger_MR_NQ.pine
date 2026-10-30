@@ -1,0 +1,63 @@
+//@version=6
+// 5. Reversión a la media RSI(2) + Bollinger — NQ/MNQ, timeframe: 5 min
+strategy("05 RSI2 Bollinger MR NQ (Prop)", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.0, slippage=1)
+
+// ---------- Inputs ----------
+tz        = "America/New_York"
+entryWin  = input.session("0935-1530", "Ventana de entrada")
+bbLen     = input.int(20, "BB largo")
+bbMult    = input.float(2.0, "BB desviaciones", step=0.5)
+rsiLen    = input.int(2, "RSI")
+rsiLow    = input.float(10, "RSI long <")
+rsiHigh   = input.float(90, "RSI short >")
+smaLen    = input.int(200, "SMA filtro")
+atrLen    = input.int(14, "ATR")
+stopK     = input.float(1.5, "Stop (x ATR)", step=0.5)
+maxBars   = input.int(6, "Máx velas en trade")
+dll       = input.float(500,  "Daily loss limit interno ($)")
+dcap      = input.float(1000, "Cap de ganancia diaria ($)")
+
+// ---------- Guard ----------
+inEntry = not na(time(timeframe.period, entryWin, tz))
+flatTm  = not na(time(timeframe.period, "1555-1600", tz))
+newDay  = timeframe.change("D")
+var float dayStart = 0.0
+if newDay
+    dayStart := strategy.netprofit
+dailyPnl = strategy.netprofit + strategy.openprofit - dayStart
+canTrade = dailyPnl > -dll and dailyPnl < dcap and not flatTm
+flat     = strategy.position_size == 0
+
+// ---------- Indicadores ----------
+[mid, up, lo] = ta.bb(close, bbLen, bbMult)
+rsi  = ta.rsi(close, rsiLen)
+sma  = ta.sma(close, smaLen)
+atr  = ta.atr(atrLen)
+
+longSig  = inEntry and canTrade and flat and rsi < rsiLow  and close < lo and close > sma
+shortSig = inEntry and canTrade and flat and rsi > rsiHigh and close > up and close < sma
+
+if longSig
+    strategy.entry("L", strategy.long)
+    strategy.exit("LX", "L", stop=close - stopK * atr)
+if shortSig
+    strategy.entry("S", strategy.short)
+    strategy.exit("SX", "S", stop=close + stopK * atr)
+
+// ---------- Salidas: banda media o tiempo ----------
+barsIn = strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+if strategy.position_size > 0 and (close > mid or barsIn >= maxBars)
+    strategy.close("L", "Mid/Time")
+if strategy.position_size < 0 and (close < mid or barsIn >= maxBars)
+    strategy.close("S", "Mid/Time")
+
+if flatTm
+    strategy.close_all("Flat EOD")
+
+// ---------- Plots ----------
+plot(up,  "BB Up",  color=color.new(color.gray, 50))
+plot(mid, "BB Mid", color=color.gray)
+plot(lo,  "BB Lo",  color=color.new(color.gray, 50))
+plot(sma, "SMA200", color=color.blue)
+bgcolor(canTrade ? na : color.new(color.red, 90))

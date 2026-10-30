@@ -1,0 +1,66 @@
+//@version=6
+// 4. Tendencia intradía Donchian + ADX con trailing ATR — NQ/MNQ, timeframe: 15 min
+strategy("04 Donchian ADX Trend NQ (Prop)", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.0, slippage=1)
+
+// ---------- Inputs ----------
+tz        = "America/New_York"
+entryWin  = input.session("0930-1500", "Ventana de entrada")
+donLen    = input.int(20, "Donchian")
+adxLen    = input.int(14, "ADX")
+adxMin    = input.float(25, "ADX mínimo")
+emaFast   = input.int(9,  "EMA rápida")
+emaSlow   = input.int(21, "EMA lenta")
+atrLen    = input.int(14, "ATR")
+trailK    = input.float(2.0, "Trailing (x ATR)", step=0.5)
+dll       = input.float(500,  "Daily loss limit interno ($)")
+dcap      = input.float(1000, "Cap de ganancia diaria ($)")
+
+// ---------- Guard ----------
+inEntry = not na(time(timeframe.period, entryWin, tz))
+flatTm  = not na(time(timeframe.period, "1545-1600", tz))
+newDay  = timeframe.change("D")
+var float dayStart = 0.0
+if newDay
+    dayStart := strategy.netprofit
+dailyPnl = strategy.netprofit + strategy.openprofit - dayStart
+canTrade = dailyPnl > -dll and dailyPnl < dcap and not flatTm
+flat     = strategy.position_size == 0
+
+// ---------- Indicadores ----------
+donH = ta.highest(high, donLen)[1]
+donL = ta.lowest(low, donLen)[1]
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+ef  = ta.ema(close, emaFast)
+es  = ta.ema(close, emaSlow)
+atr = ta.atr(atrLen)
+
+longSig  = inEntry and canTrade and flat and close > donH and adx > adxMin and ef > es
+shortSig = inEntry and canTrade and flat and close < donL and adx > adxMin and ef < es
+
+// ---------- Trailing stop ----------
+var float trail = na
+if longSig
+    strategy.entry("L", strategy.long)
+    trail := close - trailK * atr
+if shortSig
+    strategy.entry("S", strategy.short)
+    trail := close + trailK * atr
+
+if strategy.position_size > 0
+    trail := math.max(trail, close - trailK * atr)
+    strategy.exit("LX", "L", stop=trail)
+else if strategy.position_size < 0
+    trail := math.min(trail, close + trailK * atr)
+    strategy.exit("SX", "S", stop=trail)
+else
+    trail := na
+
+if flatTm
+    strategy.close_all("Flat EOD")
+
+// ---------- Plots ----------
+plot(donH, "Donchian H", color=color.new(color.green, 50))
+plot(donL, "Donchian L", color=color.new(color.red, 50))
+plot(trail, "Trail", color=color.yellow, style=plot.style_linebr)
+bgcolor(canTrade ? na : color.new(color.red, 90))

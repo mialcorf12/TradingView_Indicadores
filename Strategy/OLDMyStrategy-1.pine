@@ -64,6 +64,9 @@ allowReverse  = input.bool(true, "Revertir con señal contraria", group=G_TRADE)
 riskLowPct  = input.float(0.5, "Riesgo % equity (75%)",  minval=0.05, step=0.05, group=G_RISK)
 riskHighPct = input.float(1.0, "Riesgo % equity (100%)", minval=0.05, step=0.05, group=G_RISK)
 maxLeverage = input.float(1.0, "Apalancamiento máx.",    minval=0.1,  step=0.1,  group=G_RISK, tooltip="Tope del nocional de la posición vs equity.")
+maxContracts = input.int(10, "Máx. contratos (futuros)", minval=1, group=G_RISK, tooltip="Tope de contratos en futuros; reemplaza al tope de apalancamiento, que no aplica a futuros.")
+minOneUnit  = input.bool(true, "Mínimo 1 contrato / unidad", group=G_RISK, tooltip="Si el riesgo objetivo no alcanza para 1 contrato (típico en NQ con poco capital), opera 1 igualmente, siempre que su riesgo real no supere el máximo de abajo.")
+maxRiskPct  = input.float(2.0, "Riesgo real máx. % (mínimo 1 contrato)", minval=0.1, step=0.1, group=G_RISK, tooltip="Si 1 contrato arriesga más que esto, no se opera.")
 slMult      = input.float(1.0, "SL × ATR", minval=0.1, step=0.1, group=G_RISK)
 tpMult      = input.float(2.0, "TP × ATR", minval=0.1, step=0.1, group=G_RISK)
 useBE       = input.bool(true,  "Break-even",       group=G_RISK)
@@ -146,12 +149,16 @@ f_score(Bias trend, Bias momentum, Bias flow, Bias vix) =>
          (trend.bull ? SCORE_WEIGHT : 0) + (momentum.bull ? SCORE_WEIGHT : 0) + (flow.bull ? SCORE_WEIGHT : 0) + (vix.bull ? SCORE_WEIGHT : 0),
          (trend.bear ? SCORE_WEIGHT : 0) + (momentum.bear ? SCORE_WEIGHT : 0) + (flow.bear ? SCORE_WEIGHT : 0) + (vix.bear ? SCORE_WEIGHT : 0))
 
-// Whole units so that risk-per-trade = riskPct of equity, capped by the max notional (futures use pointvalue)
+// Whole units so that risk-per-trade = riskPct of equity (futures use pointvalue).
+// Cap: leverage x equity for non-futures; a fixed contract count for futures (1x notional is below 1 contract on small accounts).
+// Fallback to 1 unit (minOneUnit) only when its real risk stays within maxRiskPct, otherwise returns 0 → no entry.
 f_qty(float riskPct, float slDistance) =>
     float perUnit  = slDistance * syminfo.pointvalue
     float byRisk   = perUnit > 0 ? strategy.equity * riskPct / 100 / perUnit : 0.0
-    float byNotion = strategy.equity * maxLeverage / (close * syminfo.pointvalue)
-    math.floor(math.min(byRisk, byNotion))
+    float byNotion = syminfo.type == "futures" ? maxContracts : strategy.equity * maxLeverage / (close * syminfo.pointvalue)
+    float qty      = math.floor(math.min(byRisk, byNotion))
+    bool  oneOk    = minOneUnit and perUnit > 0 and byNotion >= 1 and strategy.equity * maxRiskPct / 100 >= perUnit
+    math.max(qty, oneOk ? 1.0 : 0.0)
 
 // One dashboard row: label cell + value cell sharing a background
 f_row(table t, int row, string name, string value, color bg) =>
@@ -375,7 +382,7 @@ plot(inSession ? vwapNY : na, color=color.rgb(135, 206, 235), linewidth=1, title
 plot(strategy.position_size != 0 ? slPrice : na, color=color.new(color.fuchsia, 30), style=plot.style_linebr, title="Stop", editable=false)
 plot(strategy.position_size != 0 ? tpPrice : na, color=color.new(color.blue, 30),    style=plot.style_linebr, title="Target", editable=false)
 
-var table dash = table.new(position.top_right, 2, 7, border_width=1, border_color=color.new(color.gray, 50))
+var table dash = table.new(position.top_right, 2, 12, border_width=1, border_color=color.new(color.gray, 50))
 
 if showDash and barstate.islast
     color greenDark  = color.new(color.green, 20)
@@ -395,3 +402,29 @@ if showDash and barstate.islast
     f_row(dash, 4, "P&L DÍA", str.tostring(math.round(dayPnlPct, 2)) + "%", dayPnlPct >= 0 ? greenLight : redLight)
     f_row(dash, 5, "OPERACIONES/DÍA", str.tostring(tradesToday) + " / " + str.tostring(maxDaily), tradesToday >= maxDaily ? redLight : grayDark)
     f_row(dash, 6, "TRADING", dayHalted ? "DETENIDO (PÉRDIDA)" : inSession ? "ACTIVO  ✓" : "FUERA DE SESIÓN", dayHalted ? redLight : inSession ? greenLight : grayLight)
+
+    // Diagnostics: dominant side, size it would trade, and the first gate that blocks an entry
+    bool   sideBuy  = buyers >= sellers
+    float  qShown   = sideBuy ? qLong : qShort
+    float  slDist   = sideBuy ? close - longSl : shortSl - close
+    float  riskReal = strategy.equity > 0 ? qShown * slDist * syminfo.pointvalue / strategy.equity * 100 : 0.0
+
+    string why = strategy.position_size != 0 ? "EN POSICIÓN" :
+          dayHalted ? "PÉRDIDA DIARIA" :
+          tradesToday >= maxDaily ? "MÁX. OPERACIONES" :
+          not inSession ? "FUERA DE SESIÓN" :
+          not atrFilter ? "ATR BAJO" :
+          math.max(buyers, sellers) < SCORE_ENTRY ? "SCORE < 75" :
+          (sideBuy ? not htfOkBuy : not htfOkSell) ? "HTF EN CONTRA" :
+          (sideBuy ? not vwapOkBuy : not vwapOkSell) ? "VWAP EN CONTRA" :
+          (sideBuy ? not orbOkBuy : not orbOkSell) ? "ORB EN CONTRA" :
+          (sideBuy ? not longsEnabled : not shortsEnabled) ? "LADO DESACTIVADO" :
+          not cooldownOk ? "ENFRIAMIENTO" :
+          qShown < 1 ? "CANTIDAD 0" : "LISTO ✓"
+
+    string vixLbl = vixBias.bull ? "ALCISTA" : vixBias.bear ? "BAJISTA" : "NEUTRO"
+    f_row(dash, 7, "TIPO", syminfo.type + "  x" + str.tostring(syminfo.pointvalue), grayLight)
+    f_row(dash, 8, "CANTIDAD", str.tostring(qShown) + "  (riesgo " + str.tostring(math.round(riskReal, 2)) + "%)", qShown >= 1 ? grayDark : redLight)
+    f_row(dash, 9, "VIX", str.tostring(math.round(nz(vix), 2)) + "  (" + vixLbl + ")", vixBias.bull ? greenLight : vixBias.bear ? redLight : grayLight)
+    f_row(dash, 10, "SMART MONEY", institutionalVolume ? "ACTIVO  ✓" : "DÉBIL", institutionalVolume ? greenLight : grayLight)
+    f_row(dash, 11, "MOTIVO", why, why == "LISTO ✓" or why == "EN POSICIÓN" ? greenLight : grayDark)
